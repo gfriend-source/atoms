@@ -10,6 +10,7 @@ import { useChatStore, type ChatMessage } from '@/lib/store/chat-store'
 import { useFileStore } from '@/lib/store/file-store'
 import { parseAIResponse, parseStepsFromPartial, type ParsedResponse } from '@/lib/ai/parser'
 import { getAgent } from '@/lib/ai/agents'
+import { orchestrateProjectGeneration, detectProjectRequest } from '@/lib/ai/orchestrator'
 import { cn } from '@/lib/utils'
 
 // ========== Display Helpers ==========
@@ -309,52 +310,18 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const sendMessage = useCallback(
-    async (content: string, isAutoContinue = false) => {
-      if (!content.trim() || isLoading) return
-
-      // Reset auto-continue counter when user manually sends
-      if (!isAutoContinue) {
-        autoContinueCountRef.current = 0
-      }
-
+  // ========== Stream Chat (original streaming logic for normal conversation) ==========
+  const streamChat = useCallback(
+    async (content: string, aiMsgId: string, isAutoContinue = false) => {
       const agent = getAgent(currentAgentId)
 
-      // 1. Add user message
-      const userMsgId = Date.now().toString()
-      const userMessage: ChatMessage = {
-        id: userMsgId,
-        role: 'user',
-        content: isAutoContinue ? '继续...' : content.trim(),
-        createdAt: new Date(),
-      }
-      addMessage(userMessage)
-
-      // Save user message to database (non-blocking)
-      saveMessageToDb(userMessage)
-
-      // 2. Add empty AI message placeholder
-      const aiMsgId = (Date.now() + 1).toString()
-      addMessage({
-        id: aiMsgId,
-        role: 'assistant',
-        content: '',
-        agent: agent.name,
-        agentRole: agent.role,
-        isStreaming: true,
-        createdAt: new Date(),
-      })
-
-      setLoading(true)
-
-      // 3. Prepare messages for API
+      // Prepare messages for API
       const allMessages = useChatStore.getState().messages
       const apiMessages = allMessages
         .filter((m) => m.id !== aiMsgId)
-        .slice(-30) // Keep last 30 messages for context (more for auto-continue)
+        .slice(-30)
         .map((m) => ({ role: m.role, content: m.content }))
 
-      // 4. Call /api/chat with streaming
       try {
         abortControllerRef.current = new AbortController()
 
@@ -378,10 +345,10 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
         if (!reader) throw new Error('No response body')
 
         const decoder = new TextDecoder()
-        let fullContent = '' // Raw content for parsing (never filtered)
+        let fullContent = ''
         let buffer = ''
         let lastDisplayUpdate = 0
-        const DISPLAY_THROTTLE_MS = 150 // Throttle display updates
+        const DISPLAY_THROTTLE_MS = 150
 
         while (true) {
           const { done, value } = await reader.read()
@@ -389,15 +356,14 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
 
           buffer += decoder.decode(value, { stream: true })
 
-          // Process SSE lines
           const lines = buffer.split('\n')
-          buffer = lines.pop() || '' // Keep incomplete line in buffer
+          buffer = lines.pop() || ''
 
           for (const line of lines) {
             const trimmed = line.trim()
             if (!trimmed || !trimmed.startsWith('data: ')) continue
 
-            const data = trimmed.slice(6) // Remove 'data: ' prefix
+            const data = trimmed.slice(6)
             if (data === '[DONE]') continue
 
             try {
@@ -405,16 +371,13 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
               if (parsed.text) {
                 fullContent += parsed.text
 
-                // Throttle display updates for performance
                 const now = Date.now()
                 if (now - lastDisplayUpdate > DISPLAY_THROTTLE_MS) {
                   lastDisplayUpdate = now
-                  // Convert raw content to friendly display
                   const friendlyContent = convertToFriendlyDisplay(fullContent)
                   updateMessage(aiMsgId, { content: friendlyContent })
                 }
 
-                // Parse steps incrementally for live updates
                 const steps = parseStepsFromPartial(fullContent)
                 if (steps.length > 0) {
                   updateMessage(aiMsgId, {
@@ -431,18 +394,13 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
           }
         }
 
-        // Final display update to ensure nothing is missed
+        // Final display update
         const finalFriendlyContent = convertToFriendlyDisplay(fullContent)
         updateMessage(aiMsgId, { content: finalFriendlyContent })
 
-        // 5. Parse the final complete response
-        console.log('[Chat] Stream complete, full content length:', fullContent.length)
-        console.log('[Chat] Raw content preview:', fullContent.substring(0, 200))
+        // Parse final response
         const parsed = parseAIResponse(fullContent)
-        console.log('[Chat] Parsed operations:', parsed.fileOperations.length)
-        console.log('[Chat] File paths:', parsed.fileOperations.map(op => `${op.action}:${op.path}`))
 
-        // 6. Update message with parsed data + file summary
         let finalDisplay = parsed.text
         if (parsed.fileOperations.length > 0) {
           finalDisplay += '\n\n---\n'
@@ -461,9 +419,8 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
           isStreaming: false,
         })
 
-        // 7. Apply file operations to file store
+        // Apply file operations
         if (parsed.fileOperations.length > 0) {
-          console.log('[Chat] Applying', parsed.fileOperations.length, 'file operations to store')
           const fileStoreState = useFileStore.getState()
           for (const op of parsed.fileOperations) {
             if (op.action === 'create' || op.action === 'update') {
@@ -472,13 +429,10 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
               fileStoreState.deleteFileByPath(op.path)
             }
           }
-          console.log('[Chat] File operations applied successfully')
-
-          // Save files to database (non-blocking)
           saveFilesToDb(parsed.fileOperations)
         }
 
-        // Save assistant message to database (non-blocking)
+        // Save assistant message to database
         const finalAssistantMessage: ChatMessage = {
           id: aiMsgId,
           role: 'assistant',
@@ -492,24 +446,20 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
         }
         saveMessageToDb(finalAssistantMessage)
 
-        // 8. Auto-continue detection
+        // Auto-continue detection
         const shouldContinue = detectIncomplete(fullContent, parsed)
         if (shouldContinue && autoContinueCountRef.current < MAX_AUTO_CONTINUES) {
           autoContinueCountRef.current++
-          console.log(`[AutoContinue] Triggering auto-continue #${autoContinueCountRef.current}`)
           setAutoContinueStatus(`AI 正在继续生成剩余文件... (${autoContinueCountRef.current}/${MAX_AUTO_CONTINUES})`)
-          // Delay slightly to avoid rate limits
           setTimeout(() => {
             setAutoContinueStatus(null)
             const continueMsg = '请继续生成剩余的文件代码。从上次中断的地方继续，不要重复已生成的文件。'
             sendMessage(continueMsg, true)
           }, 1000)
         } else if (shouldContinue) {
-          console.log('[AutoContinue] Max auto-continues reached, stopping')
           autoContinueCountRef.current = 0
           setAutoContinueStatus(null)
         } else {
-          // Response is complete, reset counter
           autoContinueCountRef.current = 0
           setAutoContinueStatus(null)
         }
@@ -525,8 +475,115 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
           })
         }
       } finally {
-        setLoading(false)
         abortControllerRef.current = null
+      }
+    },
+    [currentAgentId, updateMessage, saveMessageToDb, saveFilesToDb]
+  )
+
+  // ========== Main sendMessage (routes to orchestrator or stream chat) ==========
+  const sendMessage = useCallback(
+    async (content: string, isAutoContinue = false) => {
+      if (!content.trim() || isLoading) return
+
+      // Reset auto-continue counter when user manually sends
+      if (!isAutoContinue) {
+        autoContinueCountRef.current = 0
+      }
+
+      const agent = getAgent(currentAgentId)
+
+      // 1. Add user message
+      const userMsgId = Date.now().toString()
+      const userMessage: ChatMessage = {
+        id: userMsgId,
+        role: 'user',
+        content: isAutoContinue ? '继续...' : content.trim(),
+        createdAt: new Date(),
+      }
+      addMessage(userMessage)
+      saveMessageToDb(userMessage)
+
+      // 2. Add empty AI message placeholder
+      const aiMsgId = (Date.now() + 1).toString()
+      addMessage({
+        id: aiMsgId,
+        role: 'assistant',
+        content: '',
+        agent: agent.name,
+        agentRole: agent.role,
+        isStreaming: true,
+        createdAt: new Date(),
+      })
+
+      setLoading(true)
+
+      // 3. Determine if this is a project creation request
+      const isProjectRequest = detectProjectRequest(content)
+
+      if (isProjectRequest && !isAutoContinue) {
+        // Use three-phase orchestrator
+        let displayText = ''
+
+        await orchestrateProjectGeneration(content, projectId || 'new', (event) => {
+          switch (event.phase) {
+            case 'planning':
+              displayText = '🧠 ' + event.message
+              break
+            case 'planned':
+              displayText += '\n\n📋 ' + event.message + '\n'
+              if (event.plan) {
+                displayText += event.plan.files.map(f => `  - \`${f.path}\`: ${f.description}`).join('\n')
+              }
+              break
+            case 'generating':
+              displayText += `\n\n[${event.progress}] 🔨 ${event.message} ...`
+              break
+            case 'fileCreated':
+              // Replace the last "generating" line with a completed line
+              displayText = displayText.replace(
+                new RegExp(`\\[${event.progress}\\] 🔨.*\\.\\.\\.$`),
+                `[${event.progress}] ✓ ${event.file}`
+              )
+              break
+            case 'verifying':
+              displayText += '\n\n🔍 ' + event.message
+              break
+            case 'fixing':
+              displayText += `\n🔧 ${event.message}`
+              break
+            case 'complete':
+              displayText += `\n\n✅ ${event.message}`
+              break
+            case 'error':
+              displayText += `\n\n❌ ${event.message}`
+              break
+          }
+
+          updateMessage(aiMsgId, {
+            content: displayText,
+            isStreaming: event.phase !== 'complete' && event.phase !== 'error',
+          })
+        })
+
+        updateMessage(aiMsgId, { isStreaming: false })
+
+        // Save final assistant message
+        const finalAssistantMessage: ChatMessage = {
+          id: aiMsgId,
+          role: 'assistant',
+          content: displayText,
+          agent: agent.name,
+          agentRole: agent.role,
+          createdAt: new Date(),
+        }
+        saveMessageToDb(finalAssistantMessage)
+
+        setLoading(false)
+      } else {
+        // Normal conversation: use streaming
+        await streamChat(content, aiMsgId, isAutoContinue)
+        setLoading(false)
       }
     },
     [
@@ -537,6 +594,8 @@ export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?
       updateMessage,
       saveMessageToDb,
       saveFilesToDb,
+      streamChat,
+      projectId,
     ]
   )
 
