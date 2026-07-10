@@ -22,6 +22,7 @@ interface ChatStore {
   updateMessage: (id: string, partial: Partial<ChatMessage>) => void
   appendToMessage: (id: string, text: string) => void
   setLoading: (loading: boolean) => void
+  setMessages: (messages: ChatMessage[]) => void
   clearMessages: () => void
   setCurrentAgentId: (id: string) => void
 }
@@ -50,6 +51,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   setLoading: (loading) => set({ isLoading: loading }),
+  setMessages: (messages) => set({ messages }),
   clearMessages: () => set({ messages: [] }),
   setCurrentAgentId: (id) => set({ currentAgentId: id }),
 }))

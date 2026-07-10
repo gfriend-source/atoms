@@ -1,3 +1,4 @@
+import { Suspense } from 'react'
 import Sidebar from '@/components/layout/Sidebar'
 import AgentShowcase from '@/components/dashboard/AgentShowcase'
 import CreativeInput from '@/components/dashboard/CreativeInput'
@@ -19,7 +20,9 @@ export default function DashboardPage() {
           <CreativeInput />
 
           {/* Project Grid */}
-          <ProjectGrid />
+          <Suspense fallback={null}>
+            <ProjectGrid />
+          </Suspense>
         </div>
       </main>
     </div>

@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation'
 import { Home, FolderOpen, Layers, Copy, ArrowRight, FileText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
-import { ScrollArea } from '@/components/ui/scroll-area'
 
 interface Project {
   id: string
@@ -21,7 +20,7 @@ const navItems = [
 
 export default function Sidebar() {
   const [activeNav, setActiveNav] = useState('home')
-  const [projects, setProjects] = useState<Project[]>([])
+  const [recentProjects, setRecentProjects] = useState<Project[]>([])
   const [loadingProjects, setLoadingProjects] = useState(false)
   const router = useRouter()
 
@@ -32,7 +31,9 @@ export default function Sidebar() {
         const res = await fetch('/api/projects')
         if (res.ok) {
           const data = await res.json()
-          setProjects(data.projects || [])
+          const allProjects = data.projects || []
+          // 只保留最近3个项目
+          setRecentProjects(allProjects.slice(0, 3))
         }
       } catch (error) {
         console.error('获取项目列表失败:', error)
@@ -42,6 +43,15 @@ export default function Sidebar() {
     }
     fetchProjects()
   }, [])
+
+  function handleNavClick(id: string) {
+    setActiveNav(id)
+    if (id === 'home') {
+      router.push('/dashboard')
+    } else if (id === 'projects') {
+      router.push('/dashboard?tab=projects')
+    }
+  }
 
   return (
     <aside className="w-[240px] min-w-[240px] h-screen flex flex-col border-r border-gray-100 bg-white">
@@ -58,7 +68,7 @@ export default function Sidebar() {
         {navItems.map((item) => (
           <button
             key={item.id}
-            onClick={() => setActiveNav(item.id)}
+            onClick={() => handleNavClick(item.id)}
             className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
               activeNav === item.id
                 ? 'bg-indigo-50 text-indigo-600'
@@ -73,15 +83,18 @@ export default function Sidebar() {
 
       <Separator className="mx-3 my-2" />
 
-      {/* Projects List */}
-      <ScrollArea className="flex-1 min-h-0 px-3">
+      {/* Recent Projects - 最多显示3个 */}
+      <div className="flex-1 min-h-0 px-3">
+        <div className="flex items-center justify-between px-3 py-2">
+          <span className="text-xs font-medium text-gray-400 uppercase">最近项目</span>
+        </div>
         {loadingProjects ? (
-          <div className="flex items-center justify-center py-8">
+          <div className="flex items-center justify-center py-4">
             <p className="text-sm text-gray-400">加载中...</p>
           </div>
-        ) : projects.length > 0 ? (
-          <div className="space-y-1 py-2">
-            {projects.map((project) => (
+        ) : recentProjects.length > 0 ? (
+          <div className="space-y-1">
+            {recentProjects.map((project) => (
               <button
                 key={project.id}
                 onClick={() => router.push(`/workspace/${project.id}`)}
@@ -93,14 +106,11 @@ export default function Sidebar() {
             ))}
           </div>
         ) : (
-          <div className="flex items-center justify-center py-8">
-            <div className="text-center text-sm text-gray-400">
-              <p>还没有项目</p>
-              <p className="mt-1">点击&apos;首页&apos;开始。</p>
-            </div>
+          <div className="flex items-center justify-center py-4">
+            <p className="text-sm text-gray-400">还没有项目</p>
           </div>
         )}
-      </ScrollArea>
+      </div>
 
       {/* Bottom Section */}
       <div className="px-5 py-4 border-t border-gray-100">

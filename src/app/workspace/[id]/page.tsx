@@ -13,6 +13,8 @@ import {
 } from 'lucide-react'
 import ChatPanel from '@/components/workspace/ChatPanel'
 import WorkspaceTabs from '@/components/workspace/WorkspaceTabs'
+import { useChatStore } from '@/lib/store/chat-store'
+import { useFileStore, type FileNode } from '@/lib/store/file-store'
 
 export default function WorkspacePage() {
   const params = useParams()
@@ -26,10 +28,102 @@ export default function WorkspacePage() {
   const [isDragging, setIsDragging] = useState(false)
   const [projectName, setProjectName] = useState('New Project')
   const [isEditingName, setIsEditingName] = useState(false)
+  const [isLoadingProject, setIsLoadingProject] = useState(false)
+  const [dataLoaded, setDataLoaded] = useState(false)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const dragStartX = useRef(0)
   const dragStartWidth = useRef(0)
+
+  // Load persisted project data when entering an existing project
+  useEffect(() => {
+    if (projectId && projectId !== 'new') {
+      loadProjectData(projectId).then(() => setDataLoaded(true))
+    } else {
+      setDataLoaded(true)
+    }
+  }, [projectId])
+
+  async function loadProjectData(id: string) {
+    setIsLoadingProject(true)
+    try {
+      // Load project info
+      const projectRes = await fetch(`/api/projects/${id}`)
+      if (projectRes.ok) {
+        const data = await projectRes.json()
+        if (data.project?.name) {
+          setProjectName(data.project.name)
+        }
+      }
+
+      // Load chat messages
+      const messagesRes = await fetch(`/api/projects/${id}/messages`)
+      if (messagesRes.ok) {
+        const messages = await messagesRes.json()
+        if (messages.length > 0) {
+          const chatMessages = messages.map((msg: { id: string; role: 'user' | 'assistant'; content: string; agent?: string; agentRole?: string; steps?: string; createdAt: string }) => ({
+            id: msg.id,
+            role: msg.role,
+            content: msg.content,
+            agent: msg.agent || undefined,
+            agentRole: msg.agentRole || undefined,
+            steps: msg.steps ? JSON.parse(msg.steps) : undefined,
+            createdAt: new Date(msg.createdAt),
+          }))
+          useChatStore.getState().setMessages(chatMessages)
+        }
+      }
+
+      // Load project files
+      const filesRes = await fetch(`/api/projects/${id}/files`)
+      if (filesRes.ok) {
+        const files = await filesRes.json()
+        if (files.length > 0) {
+          const fileTree = rebuildFileTree(files)
+          useFileStore.getState().setFiles(fileTree)
+        }
+      }
+    } catch (err) {
+      console.error('[Workspace] Failed to load project data:', err)
+    } finally {
+      setIsLoadingProject(false)
+    }
+  }
+
+  // Rebuild flat file list into tree structure
+  function rebuildFileTree(flatFiles: { path: string; content: string }[]): FileNode[] {
+    const root: FileNode[] = []
+
+    for (const file of flatFiles) {
+      const parts = file.path.split('/')
+      let current = root
+
+      for (let i = 0; i < parts.length; i++) {
+        const name = parts[i]
+        const isFile = i === parts.length - 1
+        const currentPath = parts.slice(0, i + 1).join('/')
+
+        if (isFile) {
+          current.push({
+            name,
+            path: currentPath,
+            type: 'file',
+            content: file.content,
+            size: file.content.length,
+          })
+        } else {
+          let dir = current.find(n => n.name === name && n.type === 'directory')
+          if (!dir) {
+            dir = { name, path: currentPath, type: 'directory', children: [] }
+            current.push(dir)
+          }
+          current = dir.children!
+        }
+      }
+    }
+
+    return root
+  }
 
   // Handle drag to resize panels
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -132,7 +226,7 @@ export default function WorkspacePage() {
             className="shrink-0 border-r border-gray-200 bg-white flex flex-col transition-all duration-200"
             style={{ width: leftPanelWidth }}
           >
-            <ChatPanel initialPrompt={initialPrompt} />
+            <ChatPanel initialPrompt={dataLoaded ? initialPrompt : undefined} projectId={projectId} />
           </div>
         )}
 

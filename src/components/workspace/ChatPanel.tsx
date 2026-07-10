@@ -12,6 +12,57 @@ import { parseAIResponse, parseStepsFromPartial, type ParsedResponse } from '@/l
 import { getAgent } from '@/lib/ai/agents'
 import { cn } from '@/lib/utils'
 
+// ========== Display Helpers ==========
+
+/**
+ * Convert raw streaming content into a user-friendly display.
+ * Replaces file_operation blocks with progress indicators.
+ */
+function convertToFriendlyDisplay(rawContent: string): string {
+  let display = rawContent
+
+  // Replace fully closed file_operation blocks with "✓ 已创建" indicator
+  display = display.replace(
+    /<file_operation>\s*<action>\s*(create|update|delete)\s*<\/action>\s*<path>\s*([\s\S]*?)\s*<\/path>\s*<content>[\s\S]*?<\/content>\s*<\/file_operation>/gi,
+    (_, action, path) => {
+      const p = path.trim()
+      if (action.trim() === 'delete') return `\n🗑️ 已删除文件: \`${p}\`\n`
+      if (action.trim() === 'update') return `\n✏️ 已更新文件: \`${p}\`\n`
+      return `\n✓ 已创建文件: \`${p}\`\n`
+    }
+  )
+
+  // Replace in-progress file_operation (has path + partial content, not closed)
+  display = display.replace(
+    /<file_operation>\s*<action>\s*\w+\s*<\/action>\s*<path>\s*([\s\S]*?)\s*<\/path>\s*<content>[\s\S]*$/gi,
+    (_, path) => `\n🔨 正在创建 \`${path.trim()}\` ...\n`
+  )
+
+  // Replace in-progress file_operation (has path but no content yet)
+  display = display.replace(
+    /<file_operation>\s*<action>\s*\w+\s*<\/action>\s*<path>\s*([\s\S]*?)\s*<\/path>[\s\S]*$/gi,
+    (_, path) => `\n🔨 正在准备 \`${path.trim()}\` ...\n`
+  )
+
+  // Replace very early file_operation (no path extracted yet)
+  display = display.replace(/<file_operation>[\s\S]*$/gi, '\n⏳ 正在生成代码...')
+
+  // Clean up any remaining orphan tags
+  display = display.replace(/<\/?(?:action|path|content|file_operation)>/gi, '')
+
+  // Convert <step> tags to friendly format
+  display = display.replace(/<step>([\s\S]*?)<\/step>/gi, '📋 $1')
+  display = display.replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, '')
+  // Remove unclosed <step> or <suggestions> at the end
+  display = display.replace(/<step>[\s\S]*$/gi, '')
+  display = display.replace(/<suggestions>[\s\S]*$/gi, '')
+
+  // Clean up extra whitespace
+  display = display.replace(/\n{3,}/g, '\n\n').trim()
+
+  return display
+}
+
 // ========== Auto-Continue Helpers ==========
 
 const MAX_AUTO_CONTINUES = 3
@@ -148,23 +199,10 @@ function MessageBubble({
     )
   }
 
-  // For assistant messages, display parsed text (without raw tags)
-  const displayContent = message.isStreaming
-    ? message.content
-        .replace(/<file_operation>[\s\S]*?<\/file_operation>/gi, '')
-        .replace(/<file_operation>[\s\S]*?<\/content>/gi, '') // unclosed blocks
-        .replace(/<\/?file_operation>/gi, '')
-        .replace(/<action>[\s\S]*?<\/action>/gi, '')
-        .replace(/<path>[\s\S]*?<\/path>/gi, '')
-        .replace(/<content>[\s\S]*?<\/content>/gi, '')
-        .replace(/<step>[\s\S]*?<\/step>/gi, '')
-        .replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim()
-    : message.content
+  // For assistant messages, content is already friendly during streaming
+  // (converted by convertToFriendlyDisplay before storing)
+  const displayContent = message.content
 
-  // Extract file operations for display
-  const fileOps = message.fileOperations || []
 
   return (
     <div className="flex justify-start mb-4">
@@ -192,21 +230,7 @@ function MessageBubble({
           </ReactMarkdown>
         </div>
 
-        {/* File operations display */}
-        {fileOps.length > 0 && !message.isStreaming && (
-          <div className="mt-2 space-y-1">
-            {fileOps.map((op, idx) => (
-              <div key={idx} className="flex items-center gap-1.5 text-xs text-gray-600 bg-gray-50 rounded px-2 py-1">
-                <span className="text-green-500">\u2713</span>
-                <span>
-                  {op.action === 'create' && `\u5df2\u521b\u5efa\u6587\u4ef6: ${op.path}`}
-                  {op.action === 'update' && `\u5df2\u66f4\u65b0\u6587\u4ef6: ${op.path}`}
-                  {op.action === 'delete' && `\u5df2\u5220\u9664\u6587\u4ef6: ${op.path}`}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
+
 
         {/* Streaming indicator */}
         {message.isStreaming && (
@@ -225,12 +249,11 @@ function MessageBubble({
   )
 }
 
-export default function ChatPanel({ initialPrompt }: { initialPrompt?: string }) {
+export default function ChatPanel({ initialPrompt, projectId }: { initialPrompt?: string; projectId?: string }) {
   const {
     messages,
     addMessage,
     updateMessage,
-    appendToMessage,
     isLoading,
     setLoading,
     currentAgentId,
@@ -240,7 +263,47 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
   const initialPromptSentRef = useRef(false)
+  const sendMessageRef = useRef<((content: string) => void) | undefined>(undefined)
   const autoContinueCountRef = useRef(0)
+
+  // Helper: save a message to the database (non-blocking)
+  const saveMessageToDb = useCallback(async (message: ChatMessage) => {
+    if (!projectId || projectId === 'new') return
+    try {
+      await fetch(`/api/projects/${projectId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          role: message.role,
+          content: message.content,
+          agent: message.agent,
+          agentRole: message.agentRole,
+          steps: message.steps,
+        })
+      })
+    } catch (err) {
+      console.error('[ChatPanel] Failed to save message:', err)
+    }
+  }, [projectId])
+
+  // Helper: save files to the database (non-blocking)
+  const saveFilesToDb = useCallback(async (fileOperations: { action: string; path: string; content?: string }[]) => {
+    if (!projectId || projectId === 'new') return
+    const filesToSave = fileOperations
+      .filter(op => op.action === 'create' || op.action === 'update')
+      .map(op => ({ path: op.path, content: op.content || '' }))
+
+    if (filesToSave.length === 0) return
+    try {
+      await fetch(`/api/projects/${projectId}/files`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: filesToSave })
+      })
+    } catch (err) {
+      console.error('[ChatPanel] Failed to save files:', err)
+    }
+  }, [projectId])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -259,12 +322,16 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
 
       // 1. Add user message
       const userMsgId = Date.now().toString()
-      addMessage({
+      const userMessage: ChatMessage = {
         id: userMsgId,
         role: 'user',
         content: isAutoContinue ? '继续...' : content.trim(),
         createdAt: new Date(),
-      })
+      }
+      addMessage(userMessage)
+
+      // Save user message to database (non-blocking)
+      saveMessageToDb(userMessage)
 
       // 2. Add empty AI message placeholder
       const aiMsgId = (Date.now() + 1).toString()
@@ -311,8 +378,10 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
         if (!reader) throw new Error('No response body')
 
         const decoder = new TextDecoder()
-        let fullContent = ''
+        let fullContent = '' // Raw content for parsing (never filtered)
         let buffer = ''
+        let lastDisplayUpdate = 0
+        const DISPLAY_THROTTLE_MS = 150 // Throttle display updates
 
         while (true) {
           const { done, value } = await reader.read()
@@ -335,7 +404,15 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
               const parsed = JSON.parse(data)
               if (parsed.text) {
                 fullContent += parsed.text
-                appendToMessage(aiMsgId, parsed.text)
+
+                // Throttle display updates for performance
+                const now = Date.now()
+                if (now - lastDisplayUpdate > DISPLAY_THROTTLE_MS) {
+                  lastDisplayUpdate = now
+                  // Convert raw content to friendly display
+                  const friendlyContent = convertToFriendlyDisplay(fullContent)
+                  updateMessage(aiMsgId, { content: friendlyContent })
+                }
 
                 // Parse steps incrementally for live updates
                 const steps = parseStepsFromPartial(fullContent)
@@ -354,6 +431,10 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
           }
         }
 
+        // Final display update to ensure nothing is missed
+        const finalFriendlyContent = convertToFriendlyDisplay(fullContent)
+        updateMessage(aiMsgId, { content: finalFriendlyContent })
+
         // 5. Parse the final complete response
         console.log('[Chat] Stream complete, full content length:', fullContent.length)
         console.log('[Chat] Raw content preview:', fullContent.substring(0, 200))
@@ -361,9 +442,19 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
         console.log('[Chat] Parsed operations:', parsed.fileOperations.length)
         console.log('[Chat] File paths:', parsed.fileOperations.map(op => `${op.action}:${op.path}`))
 
-        // 6. Update message with parsed data
+        // 6. Update message with parsed data + file summary
+        let finalDisplay = parsed.text
+        if (parsed.fileOperations.length > 0) {
+          finalDisplay += '\n\n---\n'
+          finalDisplay += `✨ 已创建 ${parsed.fileOperations.length} 个文件：\n`
+          for (const op of parsed.fileOperations) {
+            const icon = op.action === 'delete' ? '🗑️' : op.action === 'update' ? '✏️' : '📄'
+            finalDisplay += `${icon} \`${op.path}\`\n`
+          }
+        }
+
         updateMessage(aiMsgId, {
-          content: parsed.text,
+          content: finalDisplay,
           steps: parsed.steps.map((s) => ({ title: s, completed: true })),
           suggestions: parsed.suggestions,
           fileOperations: parsed.fileOperations,
@@ -382,7 +473,24 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
             }
           }
           console.log('[Chat] File operations applied successfully')
+
+          // Save files to database (non-blocking)
+          saveFilesToDb(parsed.fileOperations)
         }
+
+        // Save assistant message to database (non-blocking)
+        const finalAssistantMessage: ChatMessage = {
+          id: aiMsgId,
+          role: 'assistant',
+          content: finalDisplay,
+          agent: agent.name,
+          agentRole: agent.role,
+          steps: parsed.steps.map((s) => ({ title: s, completed: true })),
+          suggestions: parsed.suggestions,
+          fileOperations: parsed.fileOperations,
+          createdAt: new Date(),
+        }
+        saveMessageToDb(finalAssistantMessage)
 
         // 8. Auto-continue detection
         const shouldContinue = detectIncomplete(fullContent, parsed)
@@ -426,8 +534,9 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
       currentAgentId,
       addMessage,
       setLoading,
-      appendToMessage,
       updateMessage,
+      saveMessageToDb,
+      saveFilesToDb,
     ]
   )
 
@@ -438,17 +547,30 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
     sendMessage(trimmed)
   }
 
-  // Auto-send initial prompt on first mount
+  // Keep a stable ref to sendMessage to avoid useEffect dependency issues
   useEffect(() => {
-    if (initialPrompt && !initialPromptSentRef.current) {
+    sendMessageRef.current = sendMessage
+  }, [sendMessage])
+
+  // Auto-send initial prompt when it becomes available and not loading
+  useEffect(() => {
+    if (initialPrompt && !initialPromptSentRef.current && !isLoading) {
+      // Check if there are already messages (e.g. loaded from history)
+      const existingMessages = useChatStore.getState().messages
+      if (existingMessages.length > 0) {
+        // Project already has history, don't auto-send
+        initialPromptSentRef.current = true
+        return
+      }
+
       initialPromptSentRef.current = true
-      // Small delay to ensure store is initialized
+      // Small delay to ensure component is fully ready
       const timer = setTimeout(() => {
-        sendMessage(initialPrompt)
-      }, 500)
+        sendMessageRef.current?.(initialPrompt)
+      }, 300)
       return () => clearTimeout(timer)
     }
-  }, [initialPrompt, sendMessage])
+  }, [initialPrompt, isLoading])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
