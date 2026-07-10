@@ -22,14 +22,7 @@ interface FlatFileItem {
   path: string
 }
 
-// Default demo data if store is empty
-const defaultFiles: FlatFileItem[] = [
-  { name: '.lock', type: 'file', size: 50, updatedAt: '2026/07/10 02:06:59', path: '.lock' },
-  { name: 'build', type: 'directory', updatedAt: '2026/07/10 01:51:40', path: 'build' },
-  { name: 'workspace', type: 'directory', updatedAt: '2026/07/10 01:51:29', path: 'workspace' },
-  { name: 'cover', type: 'directory', updatedAt: '2026/07/10 01:51:19', path: 'cover' },
-  { name: '.last_project_mode.json', type: 'file', size: 30, updatedAt: '2026/07/10 01:48:49', path: '.last_project_mode.json' },
-]
+// No default demo data - file tree starts empty for new workspaces
 
 function formatSize(size?: number): string {
   if (size === undefined || size === null) return '-'
@@ -83,9 +76,8 @@ export default function FileExplorer() {
   }, [initialized, initializeFiles])
 
   const currentFiles = useMemo(() => {
-    if (!initialized || files.length === 0) return defaultFiles
+    if (!initialized || files.length === 0) return []
     const children = getChildrenAtPath(files, currentPath)
-    if (children.length === 0 && currentPath === '') return defaultFiles
     return flattenForDisplay(children)
   }, [files, currentPath, initialized])
 

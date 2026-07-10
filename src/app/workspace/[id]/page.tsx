@@ -24,7 +24,7 @@ export default function WorkspacePage() {
   const [leftPanelWidth, setLeftPanelWidth] = useState(400)
   const [isLeftPanelCollapsed, setIsLeftPanelCollapsed] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const [projectName, setProjectName] = useState('Gomoku Game')
+  const [projectName, setProjectName] = useState('New Project')
   const [isEditingName, setIsEditingName] = useState(false)
 
   const containerRef = useRef<HTMLDivElement>(null)

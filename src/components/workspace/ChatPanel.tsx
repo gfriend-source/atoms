@@ -8,9 +8,71 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Button } from '@/components/ui/button'
 import { useChatStore, type ChatMessage } from '@/lib/store/chat-store'
 import { useFileStore } from '@/lib/store/file-store'
-import { parseAIResponse, parseStepsFromPartial } from '@/lib/ai/parser'
+import { parseAIResponse, parseStepsFromPartial, type ParsedResponse } from '@/lib/ai/parser'
 import { getAgent } from '@/lib/ai/agents'
 import { cn } from '@/lib/utils'
+
+// ========== Auto-Continue Helpers ==========
+
+const MAX_AUTO_CONTINUES = 3
+
+/**
+ * Detect whether the AI response was truncated and needs continuation.
+ * Only triggers on reliable signals: unclosed tags or explicit continuation phrases.
+ */
+function detectIncomplete(fullContent: string, parsed: ParsedResponse): boolean {
+  // If AI gave suggestions, it considers the task complete — never auto-continue
+  if (parsed.suggestions && parsed.suggestions.length > 0) {
+    console.log('[AutoContinue] AI provided suggestions, task likely complete')
+    return false
+  }
+
+  // If there are no file operations at all, this is likely a plain conversation
+  if (parsed.fileOperations.length === 0) {
+    return false
+  }
+
+  // Signal 1: Unclosed <file_operation> tags (content was truncated mid-block)
+  const openFileOps = (fullContent.match(/<file_operation>/gi) || []).length
+  const closeFileOps = (fullContent.match(/<\/file_operation>/gi) || []).length
+  if (openFileOps > closeFileOps) {
+    console.log('[AutoContinue] Detected unclosed file_operation tag')
+    return true
+  }
+
+  // Signal 2: Unclosed <content> tags (truncated inside file content)
+  const openContent = (fullContent.match(/<content>/gi) || []).length
+  const closeContent = (fullContent.match(/<\/content>/gi) || []).length
+  if (openContent > closeContent) {
+    console.log('[AutoContinue] Detected unclosed content tag')
+    return true
+  }
+
+  // Signal 3: Unclosed <action> or <path> tags
+  const openAction = (fullContent.match(/<action>/gi) || []).length
+  const closeAction = (fullContent.match(/<\/action>/gi) || []).length
+  if (openAction > closeAction) {
+    console.log('[AutoContinue] Detected unclosed action tag')
+    return true
+  }
+  const openPath = (fullContent.match(/<path>/gi) || []).length
+  const closePath = (fullContent.match(/<\/path>/gi) || []).length
+  if (openPath > closePath) {
+    console.log('[AutoContinue] Detected unclosed path tag')
+    return true
+  }
+
+  // Signal 4: AI explicitly states it will continue generating
+  const lastPart = fullContent.slice(-300)
+  const continuePatterns = /继续生成|下一轮|接下来我将|剩余文件|待生成|remaining files|will continue|next I will create/i
+  if (continuePatterns.test(lastPart)) {
+    console.log('[AutoContinue] AI indicated more files to generate')
+    return true
+  }
+
+  // All other cases: do NOT auto-continue
+  return false
+}
 
 function StepsCollapsible({ steps }: { steps: { title: string; completed: boolean }[] }) {
   const [expanded, setExpanded] = useState(false)
@@ -88,12 +150,21 @@ function MessageBubble({
 
   // For assistant messages, display parsed text (without raw tags)
   const displayContent = message.isStreaming
-    ? message.content.replace(/<file_operation>[\s\S]*?<\/file_operation>/g, '')
-        .replace(/<step>.*?<\/step>/g, '')
-        .replace(/<suggestions>[\s\S]*?<\/suggestions>/g, '')
+    ? message.content
+        .replace(/<file_operation>[\s\S]*?<\/file_operation>/gi, '')
+        .replace(/<file_operation>[\s\S]*?<\/content>/gi, '') // unclosed blocks
+        .replace(/<\/?file_operation>/gi, '')
+        .replace(/<action>[\s\S]*?<\/action>/gi, '')
+        .replace(/<path>[\s\S]*?<\/path>/gi, '')
+        .replace(/<content>[\s\S]*?<\/content>/gi, '')
+        .replace(/<step>[\s\S]*?<\/step>/gi, '')
+        .replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim()
     : message.content
+
+  // Extract file operations for display
+  const fileOps = message.fileOperations || []
 
   return (
     <div className="flex justify-start mb-4">
@@ -121,6 +192,22 @@ function MessageBubble({
           </ReactMarkdown>
         </div>
 
+        {/* File operations display */}
+        {fileOps.length > 0 && !message.isStreaming && (
+          <div className="mt-2 space-y-1">
+            {fileOps.map((op, idx) => (
+              <div key={idx} className="flex items-center gap-1.5 text-xs text-gray-600 bg-gray-50 rounded px-2 py-1">
+                <span className="text-green-500">\u2713</span>
+                <span>
+                  {op.action === 'create' && `\u5df2\u521b\u5efa\u6587\u4ef6: ${op.path}`}
+                  {op.action === 'update' && `\u5df2\u66f4\u65b0\u6587\u4ef6: ${op.path}`}
+                  {op.action === 'delete' && `\u5df2\u5220\u9664\u6587\u4ef6: ${op.path}`}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Streaming indicator */}
         {message.isStreaming && (
           <span className="inline-block w-2 h-4 bg-gray-400 animate-pulse ml-0.5" />
@@ -147,48 +234,26 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
     isLoading,
     setLoading,
     currentAgentId,
-    initMockData,
   } = useChatStore()
-  const { updateFileContent, createFile: createFileInStore } = useFileStore()
   const [input, setInput] = useState('')
+  const [autoContinueStatus, setAutoContinueStatus] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
   const initialPromptSentRef = useRef(false)
-
-  useEffect(() => {
-    initMockData()
-  }, [initMockData])
+  const autoContinueCountRef = useRef(0)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const applyFileOperations = useCallback(
-    (fileOperations: { action: string; path: string; content?: string }[]) => {
-      for (const op of fileOperations) {
-        if (op.action === 'create' || op.action === 'update') {
-          // Ensure parent directories exist and create/update the file
-          const parts = op.path.split('/')
-          const fileName = parts[parts.length - 1]
-          const parentPath = parts.slice(0, -1).join('/')
-
-          if (op.action === 'create') {
-            // Try to create the file in the file store
-            createFileInStore(parentPath || '.atoms/app/frontend', fileName, 'file')
-          }
-          // Update the file content
-          if (op.content !== undefined) {
-            updateFileContent(op.path, op.content)
-          }
-        }
-      }
-    },
-    [updateFileContent, createFileInStore]
-  )
-
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, isAutoContinue = false) => {
       if (!content.trim() || isLoading) return
+
+      // Reset auto-continue counter when user manually sends
+      if (!isAutoContinue) {
+        autoContinueCountRef.current = 0
+      }
 
       const agent = getAgent(currentAgentId)
 
@@ -197,7 +262,7 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
       addMessage({
         id: userMsgId,
         role: 'user',
-        content: content.trim(),
+        content: isAutoContinue ? '继续...' : content.trim(),
         createdAt: new Date(),
       })
 
@@ -219,7 +284,7 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
       const allMessages = useChatStore.getState().messages
       const apiMessages = allMessages
         .filter((m) => m.id !== aiMsgId)
-        .slice(-20) // Keep last 20 messages for context
+        .slice(-30) // Keep last 30 messages for context (more for auto-continue)
         .map((m) => ({ role: m.role, content: m.content }))
 
       // 4. Call /api/chat with streaming
@@ -290,7 +355,11 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
         }
 
         // 5. Parse the final complete response
+        console.log('[Chat] Stream complete, full content length:', fullContent.length)
+        console.log('[Chat] Raw content preview:', fullContent.substring(0, 200))
         const parsed = parseAIResponse(fullContent)
+        console.log('[Chat] Parsed operations:', parsed.fileOperations.length)
+        console.log('[Chat] File paths:', parsed.fileOperations.map(op => `${op.action}:${op.path}`))
 
         // 6. Update message with parsed data
         updateMessage(aiMsgId, {
@@ -303,7 +372,38 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
 
         // 7. Apply file operations to file store
         if (parsed.fileOperations.length > 0) {
-          applyFileOperations(parsed.fileOperations)
+          console.log('[Chat] Applying', parsed.fileOperations.length, 'file operations to store')
+          const fileStoreState = useFileStore.getState()
+          for (const op of parsed.fileOperations) {
+            if (op.action === 'create' || op.action === 'update') {
+              fileStoreState.addFileByPath(op.path, op.content || '')
+            } else if (op.action === 'delete') {
+              fileStoreState.deleteFileByPath(op.path)
+            }
+          }
+          console.log('[Chat] File operations applied successfully')
+        }
+
+        // 8. Auto-continue detection
+        const shouldContinue = detectIncomplete(fullContent, parsed)
+        if (shouldContinue && autoContinueCountRef.current < MAX_AUTO_CONTINUES) {
+          autoContinueCountRef.current++
+          console.log(`[AutoContinue] Triggering auto-continue #${autoContinueCountRef.current}`)
+          setAutoContinueStatus(`AI 正在继续生成剩余文件... (${autoContinueCountRef.current}/${MAX_AUTO_CONTINUES})`)
+          // Delay slightly to avoid rate limits
+          setTimeout(() => {
+            setAutoContinueStatus(null)
+            const continueMsg = '请继续生成剩余的文件代码。从上次中断的地方继续，不要重复已生成的文件。'
+            sendMessage(continueMsg, true)
+          }, 1000)
+        } else if (shouldContinue) {
+          console.log('[AutoContinue] Max auto-continues reached, stopping')
+          autoContinueCountRef.current = 0
+          setAutoContinueStatus(null)
+        } else {
+          // Response is complete, reset counter
+          autoContinueCountRef.current = 0
+          setAutoContinueStatus(null)
         }
       } catch (error) {
         if ((error as Error).name === 'AbortError') {
@@ -328,7 +428,6 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
       setLoading,
       appendToMessage,
       updateMessage,
-      applyFileOperations,
     ]
   )
 
@@ -393,6 +492,14 @@ export default function ChatPanel({ initialPrompt }: { initialPrompt?: string })
                 <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce [animation-delay:0ms]" />
                 <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce [animation-delay:150ms]" />
                 <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce [animation-delay:300ms]" />
+              </div>
+            </div>
+          )}
+          {autoContinueStatus && (
+            <div className="flex justify-start mb-4">
+              <div className="flex items-center gap-2 px-3 py-2 bg-indigo-50 rounded-lg border border-indigo-100">
+                <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-pulse" />
+                <span className="text-xs text-indigo-600">{autoContinueStatus}</span>
               </div>
             </div>
           )}

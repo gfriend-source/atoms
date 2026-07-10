@@ -7,19 +7,31 @@ export interface AgentRole {
 }
 
 const FILE_OPERATION_INSTRUCTIONS = `
-当你需要创建或修改文件时，使用以下格式：
+## 文件操作格式（必须严格遵循）
+
+当你需要创建或修改文件时，必须严格按照以下格式输出，每个标签独占一行：
+
 <file_operation>
 <action>create</action>
 <path>src/components/Example.tsx</path>
 <content>
-// 文件内容
+// 文件内容写在这里
 </content>
 </file_operation>
 
-当你需要展示步骤进度时，使用：
+重要规则：
+- action 只能是 create、update 或 delete
+- path 必须是相对路径（如 src/components/App.tsx）
+- 每个标签独占一行，标签前后不要有多余空格
+- </file_operation> 闭合标签必须存在
+- 一次可以输出多个 <file_operation> 块
+
+## 步骤格式
+当你需要展示步骤进度时：
 <step>步骤描述</step>
 
-回复结束后如果有建议的后续操作，使用：
+## 建议格式
+回复结束后如果有建议的后续操作：
 <suggestions>
 建议1
 建议2
@@ -40,6 +52,8 @@ export const AGENTS: AgentRole[] = [
 1. 分析需求，制定简要实现计划
 2. 逐步编写代码，创建必要的文件
 3. 确保代码质量和最佳实践
+
+重要：如果一次无法生成所有文件，请在当前响应中尽可能多地生成文件，并在最后明确说明还有哪些文件需要在下一轮继续生成。确保每个 <file_operation> 块都完整闭合。
 ${FILE_OPERATION_INSTRUCTIONS}`,
   },
   {

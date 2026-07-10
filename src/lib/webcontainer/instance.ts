@@ -52,3 +52,29 @@ export async function startDevServer(
     })
   })
 }
+
+/**
+ * Start a simple static file server for plain HTML/CSS/JS projects.
+ * Injects a __server.js and runs it with Node.
+ */
+export async function startStaticServer(
+  instance: WebContainer,
+  onOutput?: (data: string) => void
+): Promise<{ url: string; output: string }> {
+  const serverProcess = await instance.spawn('node', ['__server.js'])
+  let output = ''
+  serverProcess.output.pipeTo(
+    new WritableStream({
+      write(data) {
+        output += data
+        onOutput?.(data)
+      },
+    })
+  )
+
+  return new Promise((resolve) => {
+    instance.on('server-ready', (port, url) => {
+      resolve({ url, output })
+    })
+  })
+}

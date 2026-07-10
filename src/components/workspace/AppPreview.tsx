@@ -8,6 +8,7 @@ import {
   mountFiles,
   installDependencies,
   startDevServer,
+  startStaticServer,
 } from '@/lib/webcontainer/instance'
 import type { WebContainer } from '@webcontainer/api'
 
@@ -43,19 +44,77 @@ function convertToFileSystemTree(nodes: FileNode[]): Record<string, any> {
 }
 
 /**
- * Extract the frontend app files from the file store tree.
- * We look for .atoms/app/frontend and return its children converted.
+ * Find a file node by name recursively in the file tree.
  */
-function getFrontendFiles(files: FileNode[]): Record<string, any> | null {
-  // Find .atoms/app/frontend
-  const atoms = files.find((f) => f.name === '.atoms')
-  if (!atoms?.children) return null
-  const app = atoms.children.find((f) => f.name === 'app')
-  if (!app?.children) return null
-  const frontend = app.children.find((f) => f.name === 'frontend')
-  if (!frontend?.children) return null
-  return convertToFileSystemTree(frontend.children)
+function findFile(files: FileNode[], name: string): FileNode | undefined {
+  for (const f of files) {
+    if (f.type === 'file' && f.name === name) return f
+    if (f.type === 'directory' && f.children) {
+      const found = findFile(f.children, name)
+      if (found) return found
+    }
+  }
+  return undefined
 }
+
+/** Static file server code injected for pure HTML/CSS/JS projects */
+const STATIC_SERVER_CODE = `
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const MIME_TYPES = {
+  '.html': 'text/html',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+};
+
+const server = http.createServer((req, res) => {
+  let filePath = '.' + (req.url === '/' ? '/index.html' : req.url);
+  // Remove query string
+  filePath = filePath.split('?')[0];
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+
+  fs.readFile(filePath, (err, content) => {
+    if (err) {
+      if (err.code === 'ENOENT') {
+        // Try index.html for SPA fallback
+        fs.readFile('./index.html', (err2, fallback) => {
+          if (err2) {
+            res.writeHead(404);
+            res.end('Not Found');
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(fallback);
+          }
+        });
+      } else {
+        res.writeHead(500);
+        res.end('Server Error');
+      }
+    } else {
+      res.writeHead(200, { 'Content-Type': contentType });
+      res.end(content);
+    }
+  });
+});
+
+server.listen(3000, () => {
+  console.log('Static server running on port 3000');
+});
+`;
 
 export default function AppPreview() {
   const [status, setStatus] = useState<Status>('idle')
@@ -89,44 +148,77 @@ export default function AppPreview() {
     setConsoleOutput([])
 
     try {
+      // Check if there are files to preview
+      if (files.length === 0) {
+        throw new Error('没有文件可预览。请先让 AI 生成代码。')
+      }
+
       // Boot WebContainer
       appendConsole('> Booting WebContainer...')
       const instance = await getWebContainerInstance()
       instanceRef.current = instance
       appendConsole('✓ WebContainer ready')
 
-      // Convert and mount files
-      const fsTree = getFrontendFiles(files)
-      if (!fsTree) {
-        throw new Error('未找到前端项目文件 (.atoms/app/frontend)')
+      // Detect project type
+      const hasPackageJson = !!findFile(files, 'package.json')
+      const hasIndexHtml = !!findFile(files, 'index.html')
+
+      if (!hasPackageJson && !hasIndexHtml) {
+        throw new Error('无法预览：未找到 index.html 或 package.json')
       }
 
-      appendConsole('> Mounting files...')
-      await mountFiles(instance, fsTree)
-      appendConsole('✓ Files mounted')
+      // Convert file tree to WebContainer format
+      let fsTree = convertToFileSystemTree(files)
 
-      // Install dependencies
-      setStatus('installing')
-      appendConsole('> npm install...')
-      const { exitCode } = await installDependencies(instance, (data) => {
-        appendConsole(data)
-      })
+      if (hasPackageJson) {
+        // Node project flow: npm install + npm run dev
+        appendConsole('> Mounting files...')
+        await mountFiles(instance, fsTree)
+        appendConsole('✓ Files mounted')
 
-      if (exitCode !== 0) {
-        throw new Error(`npm install 失败 (exit code: ${exitCode})`)
+        setStatus('installing')
+        appendConsole('> npm install...')
+        const { exitCode } = await installDependencies(instance, (data) => {
+          appendConsole(data)
+        })
+
+        if (exitCode !== 0) {
+          throw new Error(`npm install 失败 (exit code: ${exitCode})`)
+        }
+        appendConsole('✓ Dependencies installed')
+
+        setStatus('compiling')
+        appendConsole('> Starting dev server...')
+        const { url } = await startDevServer(instance, (data) => {
+          appendConsole(data)
+        })
+
+        setPreviewUrl(url)
+        setStatus('running')
+        appendConsole(`✓ Server ready at ${url}`)
+      } else {
+        // Pure HTML/CSS/JS project - inject static server
+        fsTree = {
+          ...fsTree,
+          '__server.js': {
+            file: { contents: STATIC_SERVER_CODE },
+          },
+        }
+
+        appendConsole('> Mounting files...')
+        await mountFiles(instance, fsTree)
+        appendConsole('✓ Files mounted')
+
+        setStatus('compiling')
+        appendConsole('> Starting static server...')
+        const { url } = await startStaticServer(instance, (data) => {
+          appendConsole(data)
+        })
+
+        setPreviewUrl(url)
+        setStatus('running')
+        appendConsole(`✓ Preview ready at ${url}`)
       }
-      appendConsole('✓ Dependencies installed')
-
-      // Start dev server
-      setStatus('compiling')
-      appendConsole('> Starting dev server...')
-      const { url } = await startDevServer(instance, (data) => {
-        appendConsole(data)
-      })
-
-      setPreviewUrl(url)
-      setStatus('running')
-      appendConsole(`✓ Server ready at ${url}`)
     } catch (err: any) {
       setStatus('error')
       const msg = err?.message || '启动失败'
@@ -155,22 +247,52 @@ export default function AppPreview() {
     appendConsole('> Refreshing...')
 
     try {
-      const fsTree = getFrontendFiles(files)
-      if (!fsTree) {
-        throw new Error('未找到前端项目文件 (.atoms/app/frontend)')
+      if (files.length === 0) {
+        throw new Error('没有文件可预览。请先让 AI 生成代码。')
       }
 
-      await mountFiles(instanceRef.current, fsTree)
-      appendConsole('✓ Files re-mounted')
+      const hasPackageJson = !!findFile(files, 'package.json')
+      const hasIndexHtml = !!findFile(files, 'index.html')
 
-      appendConsole('> Restarting dev server...')
-      const { url } = await startDevServer(instanceRef.current, (data) => {
-        appendConsole(data)
-      })
+      if (!hasPackageJson && !hasIndexHtml) {
+        throw new Error('无法预览：未找到 index.html 或 package.json')
+      }
 
-      setPreviewUrl(url)
-      setStatus('running')
-      appendConsole(`✓ Server ready at ${url}`)
+      let fsTree = convertToFileSystemTree(files)
+
+      if (hasPackageJson) {
+        await mountFiles(instanceRef.current, fsTree)
+        appendConsole('✓ Files re-mounted')
+
+        appendConsole('> Restarting dev server...')
+        const { url } = await startDevServer(instanceRef.current, (data) => {
+          appendConsole(data)
+        })
+
+        setPreviewUrl(url)
+        setStatus('running')
+        appendConsole(`✓ Server ready at ${url}`)
+      } else {
+        // Static project refresh
+        fsTree = {
+          ...fsTree,
+          '__server.js': {
+            file: { contents: STATIC_SERVER_CODE },
+          },
+        }
+
+        await mountFiles(instanceRef.current, fsTree)
+        appendConsole('✓ Files re-mounted')
+
+        appendConsole('> Restarting static server...')
+        const { url } = await startStaticServer(instanceRef.current, (data) => {
+          appendConsole(data)
+        })
+
+        setPreviewUrl(url)
+        setStatus('running')
+        appendConsole(`✓ Preview ready at ${url}`)
+      }
     } catch (err: any) {
       setStatus('error')
       const msg = err?.message || '刷新失败'
